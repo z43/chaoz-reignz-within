@@ -1,0 +1,1059 @@
+create or replace package pkg_nnet__test_im is
+
+  -- Author  : IMIHOVSKI
+  -- Created : 06/04/2015 11:23:22 AM
+  -- Purpose : imihovski test package
+    
+    type num_arr is table of number;
+    
+    --train network
+    procedure p_nnt_run(  ip_nn_id in number,--id of existing neural network - null if not
+                          ip_num_input in number,--number of input perceptrons
+                          ip_num_hidden in number,--number of hidden perceptrons
+                          ip_num_output in number,--number of output perceptrons
+                          ip_lr in number,--learning rate
+                          ip_moment in number,--momentum
+                          ip_max_epochs in number, 
+                          ip_accuracy in number, 
+                          ip_mse in number,
+                          ip_set_id in number default null,--set data for training
+                          ip_batch_id in number default null--batch of data
+                        );
+    --use existing network
+    procedure p_nn_run( ip_nn_id in number, 
+                        ip_inputs in num_arr
+                      );
+    
+end pkg_nnet__test_im;
+
+
+create or replace package body pkg_nnet__test_im is
+    
+    /*******************************************************************
+    * nn - neural network
+    * nnt - neural network trainer  
+    ********************************************************************/
+
+    --type num_arr is table of number;
+    type multi_num_arr is table of num_arr;
+    
+    type data_rec is record(
+                                      input_data num_arr,
+                                      res_data num_arr
+                                  );
+    type data_recs is table of data_rec;           
+    
+    type data_set is record (
+                                training_set data_recs,
+                                generalization_set data_recs,
+                                validation_set data_recs
+                            );
+    
+    x_data_set data_set;
+    -----------------------------------------------------------------------------------------------
+    --NEURAL NETWORK PARAMS
+    -----------------------------------------------------------------------------------------------
+    cnt_input_neurons number := 0;
+    cnt_hidden_neurons number := 0;
+    cnt_output_neurons number := 0;
+    
+    input_neurons_arr num_arr := num_arr();
+    hidden_neurons_arr num_arr := num_arr();
+    output_neurons_arr num_arr := num_arr();
+    
+    weights_input_hidden_arr multi_num_arr := multi_num_arr();
+    weights_hidden_output_arr multi_num_arr := multi_num_arr();
+    
+    -----------------------------------------------------------------------------------------------
+    --NEURAL NETWORK TRAINNER PARAMS
+    -----------------------------------------------------------------------------------------------
+    --learning parameters
+    learning_rate number := 0.001; --adjusts the step size of the weight update    
+    momentum number := 0.9;--improves performance of stochastic learning
+
+    --epoch counter
+    epoch number := 0;
+    max_epochs number := 10;
+    
+    --accuracy/MSE required
+    desired_accuracy number := 99;
+    desired_mse number := 0.001;
+    
+    --change to weights
+    delta_input_hidden_arr multi_num_arr := multi_num_arr();
+    delta_hidden_output_arr multi_num_arr := multi_num_arr();
+
+    --error gradients
+    hidden_error_gradients_arr num_arr := num_arr();
+    output_error_gradients_arr num_arr := num_arr();
+
+    --accuracy stats per epoch
+    training_set_accuracy number := 0;
+    validation_set_accuracy number := 0;
+    generalization_set_accuracy number := 0;
+    training_set_mse number := 1;
+    validation_set_mse number := 1;
+    generalization_set_mse number := 1;
+    
+    use_batch number := 0;--used if the data is too much for a single load
+    
+    -----------------------------------------------------------------------------------------------
+    -----------------------------------------------------------------------------------------------
+    -----------------------------------------------------------------------------------------------
+    -----------------------------------------------------------------------------------------------
+    -----------------------------------------------------------------------------------------------
+    --NEURAL NETWORK FUNCS/PROCS
+    -----------------------------------------------------------------------------------------------
+    -----------------------------------------------------------------------------------------------
+    --PRINT DATA FUNCS/PROCS
+    -----------------------------------------------------------------------------------------------
+    /*******************************************************************
+    * Print NN weight data
+    ********************************************************************/
+    procedure p_nn_print_weight_data(ip_weight_type in varchar2)
+    is
+    begin
+        --NN weights
+        if ip_weight_type in ('ALL', 'NN', 'IN_TO_HID') then
+            dbms_output.put_line('NN IN_TO_HID ARR');
+            --print weights between input and hidden         
+            for z in 1..cnt_input_neurons
+            loop
+                for z1 in 1..cnt_hidden_neurons
+                loop
+                    --set weights to random values
+                    dbms_output.put_line('IN Nrn('||z||') -> HID Nrn('||z1||') w :'||weights_input_hidden_arr(z)(z1));            
+                end loop;
+            end loop;
+        end if;
+        if ip_weight_type in ('ALL', 'NN', 'HID_TO_OUT') then
+            dbms_output.put_line('NN HID_TO_OUT ARR');
+            --print weights between hidden and output
+            for z in 1..cnt_hidden_neurons
+            loop
+                for z1 in 1..cnt_output_neurons
+                loop
+                    --set weights to random values
+                    dbms_output.put_line('IN Nrn('||z||') -> HID Nrn('||z1||') w :'||weights_hidden_output_arr(z)(z1));            
+                end loop;
+            end loop;
+        end if;
+    end;
+    /*******************************************************************
+    * Print neuron data
+    ********************************************************************/
+    procedure p_nn_print_neuron_data(ip_neuron_type in varchar2)
+    is
+    begin
+        --input neurons arr
+        if ip_neuron_type in ('ALL', 'INPUT') then
+            dbms_output.put_line('INPUT NEURONS');
+            --print weights between input and hidden         
+            for z in 1..cnt_input_neurons
+            loop
+                --set weights to random values
+                dbms_output.put_line('IN Nrn('||z||') Value :'||input_neurons_arr(z));
+            end loop;
+        end if;
+        --hidden neurons arr
+        if ip_neuron_type in ('ALL', 'HIDDEN') then
+            dbms_output.put_line('HIDDEN NEURONS');
+            --print weights between input and hidden         
+            for z in 1..cnt_hidden_neurons
+            loop
+                --set weights to random values
+                dbms_output.put_line('HID Nrn('||z||') Value :'||hidden_neurons_arr(z));
+            end loop;
+        end if;
+        --output neurons arr
+        if ip_neuron_type in ('ALL', 'OUTPUT') then
+            dbms_output.put_line('OUTPUT NEURONS');
+            --print weights between input and hidden         
+            for z in 1..cnt_output_neurons
+            loop
+                --set weights to random values
+                dbms_output.put_line('OUT Nrn('||z||') Value :'||output_neurons_arr(z));
+            end loop;
+        end if;
+    end;
+    -----------------------------------------------------------------------------------------------
+    --PROCESS DATA FUNCS/PROCS
+    -----------------------------------------------------------------------------------------------
+    /*******************************************************************
+    * Save cuurent network data
+    ********************************************************************/
+    procedure p_nn_save_data( ip_nn_id in number )
+    is 
+    begin
+        --insert into table to be added
+        if ip_nn_id is not null then 
+            null;
+        end if;
+    end;
+    /*******************************************************************
+    * Load existing network data
+    ********************************************************************/
+    procedure p_nn_load_data( ip_nn_id in number )
+    is 
+    begin
+        --select from table to be added
+        if ip_nn_id is not null then 
+            null;
+        end if;
+    end;
+    /*******************************************************************
+    * Save cuurent network weight data
+    ********************************************************************/
+    procedure p_nn_save_weight_data( ip_nn_id in number )
+    is 
+    begin
+        --insert into table to be added
+        if ip_nn_id is not null then 
+            null;
+        end if;
+    end;
+    /*******************************************************************
+    * Load existing network weight data
+    ********************************************************************/
+    procedure p_nn_load_weight_data( ip_nn_id in number )
+    is 
+    begin
+        --select from table to be added
+        if ip_nn_id is not null then 
+            null;
+        end if;
+    end;
+    /*******************************************************************
+    * Initialize new network with random weights
+    ********************************************************************/
+    procedure p_nn_init_weights_arrs
+    is
+        rH number := 0;
+        rO number := 0;
+    begin
+        --set range
+        rH := 1/sqrt(cnt_input_neurons);
+        rO := 1/sqrt(cnt_hidden_neurons);
+        
+        --set weights between input and hidden
+        weights_input_hidden_arr.extend(cnt_input_neurons);      
+        for z in 1..cnt_input_neurons
+        loop
+            
+            weights_input_hidden_arr(z) := num_arr();
+            weights_input_hidden_arr(z).extend(cnt_hidden_neurons);
+            for z1 in 1..cnt_hidden_neurons
+            loop
+                --set weights to random values
+                weights_input_hidden_arr(z)(z1) := ( ((dbms_random.value(0,100))+1)/100  * 2 * rH ) - rH;            
+            end loop;
+        end loop;
+        
+        --set weights between input and hidden
+        weights_hidden_output_arr.extend(cnt_hidden_neurons);
+        for z in 1..cnt_hidden_neurons
+        loop
+            weights_hidden_output_arr(z) := num_arr();
+            weights_hidden_output_arr(z).extend(cnt_output_neurons);
+            for z1 in 1..cnt_output_neurons
+            loop
+                --set weights to random values
+                weights_hidden_output_arr(z)(z1) := ( ((dbms_random.value(0,100))+1)/100  * 2 * rO ) - rO;            
+            end loop;
+        end loop;
+
+    end;
+    /*******************************************************************
+    * Initialize new network with 0
+    ********************************************************************/
+    procedure p_nn_init_arrs( ip_inp in number, ip_hidd in number, ip_out in number )
+    is
+    begin
+        
+        cnt_input_neurons := ip_inp;
+        cnt_hidden_neurons := ip_hidd;
+        cnt_output_neurons := ip_out;
+        
+        --init neurons
+        input_neurons_arr.extend(cnt_input_neurons);
+        for z in 1..cnt_input_neurons 
+        loop
+            input_neurons_arr(z) := 0;
+        end loop;
+        hidden_neurons_arr.extend(cnt_hidden_neurons);
+        for z in 1..cnt_hidden_neurons 
+        loop
+            hidden_neurons_arr(z) := 0;
+        end loop;
+        output_neurons_arr.extend(cnt_output_neurons);
+        for z in 1..cnt_output_neurons 
+        loop
+            output_neurons_arr(z) := 0;
+        end loop;
+    end;
+    
+    /*******************************************************************
+    * Activation Function
+    ********************************************************************/
+    function f_nn_activation_func( ip_x in number ) return number
+    is 
+    begin
+        --sigmoid function
+        return 1/(1+exp(-ip_x));
+    end;
+    
+    /*******************************************************************
+    * Output Clamping
+    ********************************************************************/
+    function f_nn_clamp_output( ip_x in number ) return number
+    is
+    begin
+        if ( ip_x < 0.1 ) then 
+            return 0;
+        else 
+            if ( ip_x > 0.9 ) then 
+                return 1;
+            else 
+                return -1;
+            end if;
+        end if; 
+    end;
+    
+    /*******************************************************************
+    * Feed Forward Operation
+    ********************************************************************/
+    procedure p_nn_feed_forward( ip_pattern in num_arr )
+    is
+    begin
+    
+        --set input neurons to input values
+        for z in 1..cnt_input_neurons
+        loop
+            input_neurons_arr(z) := ip_pattern(z);
+        end loop;
+        
+        --Calculate Hidden Layer values - include bias neuron
+        for z in 1..cnt_hidden_neurons
+        loop
+            --clear value
+            hidden_neurons_arr(z) := 0;                
+            
+            --get weighted sum of pattern and bias neuron
+            for z1 in 1..cnt_input_neurons
+            loop
+                hidden_neurons_arr(z) := hidden_neurons_arr(z) 
+                                         + input_neurons_arr(z1) * weights_input_hidden_arr(z1)(z);
+                
+            end loop;
+            
+            --set to result of sigmoid
+            hidden_neurons_arr(z) := f_nn_activation_func(hidden_neurons_arr(z));            
+        
+        end loop;
+        
+        --Calculating Output Layer values - include bias neuron
+        for z in 1..cnt_output_neurons
+        loop
+            --clear value
+            output_neurons_arr(z) := 0;                
+            
+            --get weighted sum of pattern and bias neuron
+            for z1 in 1..cnt_hidden_neurons
+            loop
+                output_neurons_arr(z) := output_neurons_arr(z) 
+                                         + hidden_neurons_arr(z1) * weights_hidden_output_arr(z1)(z);
+            end loop;
+            
+            --set to result of sigmoid
+            output_neurons_arr(z) := f_nn_activation_func( output_neurons_arr(z) );
+            
+        end loop;
+        
+    end;
+    /*******************************************************************
+    * Feed pattern through network and return results
+    ********************************************************************/
+    function f_nn_feed_forward_pattern( ip_pattern in num_arr ) return num_arr
+    is
+        x_res num_arr := num_arr();
+    begin
+    
+        p_nn_feed_forward(ip_pattern);
+
+        --create copy of output results
+        x_res.extend(cnt_output_neurons);
+        for z in 1..cnt_output_neurons
+        loop
+            x_res(z) := f_nn_clamp_output(output_neurons_arr(z));
+        end loop;
+        
+        return x_res;
+    
+    end;
+    
+    -----------------------------------------------------------------------------------------------
+    -----------------------------------------------------------------------------------------------
+    -----------------------------------------------------------------------------------------------
+    -----------------------------------------------------------------------------------------------
+    -----------------------------------------------------------------------------------------------
+    --NEURAL NETWORK TRAINER FUNCS/PROCS
+    -----------------------------------------------------------------------------------------------
+        
+    -----------------------------------------------------------------------------------------------
+    --LOAD DATA FUNCS/PROCS
+    -----------------------------------------------------------------------------------------------
+    /*******************************************************************
+    * Load training set
+    ********************************************************************/
+    function f_nnt_load_random_data_recs(ip_data_recs_type in varchar2) return data_recs
+    is
+        x_data_recs data_recs := data_recs();
+        x_cnt number := 0;
+    begin
+        
+        case ip_data_recs_type
+            when 'TRAINING' then x_cnt := 100;
+            when 'GENERALIZATION' then x_cnt := 20;
+            when 'VALIDATION' then x_cnt := 20;
+            else x_cnt := 0;
+        end case;
+        
+        x_data_recs.extend(x_cnt);
+        for z in 1..x_cnt
+        loop
+            x_data_recs(z).input_data := num_arr();
+            x_data_recs(z).res_data := num_arr();
+            
+            x_data_recs(z).input_data.extend(cnt_input_neurons);    
+            for z1 in 1..cnt_input_neurons
+            loop
+                x_data_recs(z).input_data(z1) := round(dbms_random.value(0,100),0);
+            end loop;
+            x_data_recs(z).res_data.extend(cnt_output_neurons);
+            for z1 in 1..cnt_output_neurons
+            loop
+                x_data_recs(z).res_data(z1) := round(dbms_random.value(-1,1),0);
+            end loop;
+        end loop;
+
+        return x_data_recs;
+    end;
+    /*******************************************************************
+    * Load training set
+    ********************************************************************/
+    procedure p_nnt_load_training_set(ip_set_id in number, ip_batch_id in number)
+    is
+    begin
+        x_data_set.training_set := data_recs();
+        if ip_set_id is null and ip_batch_id is null then
+            x_data_set.training_set := f_nnt_load_random_data_recs('TRAINING');
+        end if;
+    end;
+    /*******************************************************************
+    * Load generalization set
+    ********************************************************************/
+    procedure p_nnt_load_generalization_set(ip_set_id in number, ip_batch_id in number)
+    is
+    begin
+        x_data_set.generalization_set := data_recs();
+        if ip_set_id is null and ip_batch_id is null then
+            x_data_set.generalization_set := f_nnt_load_random_data_recs('GENERALIZATION');
+        end if;
+    end;
+    /*******************************************************************
+    * Load validation set
+    ********************************************************************/
+    procedure p_nnt_load_validation_set(ip_set_id in number, ip_batch_id in number)
+    is
+    begin
+        x_data_set.validation_set := data_recs();
+        if ip_set_id is null and ip_batch_id is null then
+            x_data_set.validation_set := f_nnt_load_random_data_recs('VALIDATION');
+        end if;
+    end;
+    /*******************************************************************
+    * Load data set
+    ********************************************************************/
+    procedure p_nnt_load_data_set(ip_set_id in number, ip_batch_id in number default null)
+    is
+    begin
+        p_nnt_load_training_set(ip_set_id, ip_batch_id);
+        p_nnt_load_generalization_set(ip_set_id, ip_batch_id);
+        p_nnt_load_validation_set(ip_set_id, ip_batch_id);
+    end;
+    -----------------------------------------------------------------------------------------------
+    --PRINT DATA FUNCS/PROCS
+    -----------------------------------------------------------------------------------------------
+    /*******************************************************************
+    * Print NNT weight data
+    ********************************************************************/
+    procedure p_nnt_print_weight_data(ip_weight_type in varchar2)
+    is
+    begin
+        --NNtrainer delta weights
+        if ip_weight_type in ('ALL', 'NNT', 'IN_TO_HID') then
+            dbms_output.put_line('NNT IN_TO_HID ARR');
+            --print weights between input and hidden         
+            for z in 1..cnt_input_neurons
+            loop
+                for z1 in 1..cnt_hidden_neurons
+                loop
+                    --set weights to random values
+                    dbms_output.put_line('IN Nrn('||z||') -> HID Nrn('||z1||') w :'||delta_input_hidden_arr(z)(z1));            
+                end loop;
+            end loop;
+        end if;
+        if ip_weight_type in ('ALL', 'NNT', 'HID_TO_OUT') then
+            dbms_output.put_line('NNT HID_TO_OUT ARR');
+            --print weights between hidden and output
+            for z in 1..cnt_hidden_neurons
+            loop
+                for z1 in 1..cnt_output_neurons
+                loop
+                    --set weights to random values
+                    dbms_output.put_line('IN Nrn('||z||') -> HID Nrn('||z1||') w :'||delta_hidden_output_arr(z)(z1));            
+                end loop;
+            end loop;
+        end if;
+    end;
+    /*******************************************************************
+    * Print data set
+    ********************************************************************/
+    procedure p_nnt_print_data_set(ip_set_type in varchar2)
+    is
+        x_str varchar2(4000) := null;
+    begin
+        
+        if ip_set_type in ('ALL', 'TRAINING') then
+            dbms_output.put_line('Training set');
+            
+            for z in x_data_set.training_set.first..x_data_set.training_set.last
+            loop
+                x_str := null;
+               
+                for z1 in x_data_set.training_set(z).input_data.first..x_data_set.training_set(z).input_data.last
+                loop
+                    x_str := x_str||' / '||x_data_set.training_set(z).input_data(z1);
+                end loop;
+                
+                x_str := x_str||' RES : ';
+                for z1 in x_data_set.training_set(z).res_data.first..x_data_set.training_set(z).res_data.last
+                loop
+                    x_str := x_str||' / '||x_data_set.training_set(z).res_data(z1);
+                end loop;
+                
+                dbms_output.put_line(x_str);
+            end loop;
+        end if;
+        
+        if ip_set_type in ('ALL', 'GENERALIZATION') then
+            dbms_output.put_line('Generalization set');
+            for z in x_data_set.generalization_set.first..x_data_set.generalization_set.last
+            loop
+                x_str := null;
+               
+                for z1 in x_data_set.generalization_set(z).input_data.first..x_data_set.generalization_set(z).input_data.last
+                loop
+                    x_str := x_str||' / '||x_data_set.generalization_set(z).input_data(z1);
+                end loop;
+                
+                x_str := x_str||' RES : ';
+                for z1 in x_data_set.generalization_set(z).res_data.first..x_data_set.generalization_set(z).res_data.last
+                loop
+                    x_str := x_str||' / '||x_data_set.generalization_set(z).res_data(z1);
+                end loop;
+                
+                dbms_output.put_line(x_str);
+            end loop;
+        end if;
+        
+        if ip_set_type in ('ALL', 'VALIDATION') then
+            dbms_output.put_line('Validation set');
+            for z in x_data_set.validation_set.first..x_data_set.validation_set.last
+            loop
+                x_str := null;
+               
+                for z1 in x_data_set.validation_set(z).input_data.first..x_data_set.validation_set(z).input_data.last
+                loop
+                    x_str := x_str||' / '||x_data_set.validation_set(z).input_data(z1);
+                end loop;
+                
+                x_str := x_str||' RES : ';
+                for z1 in x_data_set.validation_set(z).res_data.first..x_data_set.validation_set(z).res_data.last
+                loop
+                    x_str := x_str||' / '||x_data_set.validation_set(z).res_data(z1);
+                end loop;
+                
+                dbms_output.put_line(x_str);
+            end loop;
+        end if;        
+    end;
+    -----------------------------------------------------------------------------------------------
+    --PROCESS DATA FUNCS/PROCS
+    -----------------------------------------------------------------------------------------------
+    /*******************************************************************
+    * Initialize training arrays with 0
+    ********************************************************************/
+    procedure p_nnt_init_arrs
+    is 
+    begin
+        delta_input_hidden_arr.extend(cnt_input_neurons);
+        for z in 1..cnt_input_neurons
+        loop
+            delta_input_hidden_arr(z) := num_arr();
+            delta_input_hidden_arr(z).extend(cnt_hidden_neurons);
+            for z1 in 1..cnt_hidden_neurons
+            loop
+                delta_input_hidden_arr(z)(z1) := 0;
+            end loop;
+        end loop;
+        delta_hidden_output_arr.extend(cnt_hidden_neurons);
+        for z in 1..cnt_hidden_neurons
+        loop
+            delta_hidden_output_arr(z) := num_arr();
+            delta_hidden_output_arr(z).extend(cnt_output_neurons);
+            for z1 in 1..cnt_output_neurons
+            loop
+                delta_hidden_output_arr(z)(z1) := 0;
+            end loop;
+        end loop;
+        
+        --create error gradient arrs
+        hidden_error_gradients_arr.extend(cnt_hidden_neurons);
+        for z in 1..cnt_hidden_neurons
+        loop
+            hidden_error_gradients_arr(z) := 0;
+        end loop;
+        
+        output_error_gradients_arr.extend(cnt_output_neurons);
+        for z in 1..cnt_output_neurons
+        loop
+            output_error_gradients_arr(z) := 0;
+        end loop;
+        
+    end;
+    
+    /*******************************************************************
+    * Set training params
+    ********************************************************************/
+    procedure p_nnt_set_parameters( ip_lr in number, ip_moment in number, ip_batch_id in number)
+    is
+    begin
+        if ip_lr is not null then
+            learning_rate := ip_lr;
+        end if;
+        
+        if ip_moment is not null then
+            momentum := ip_moment;
+        end if;
+        
+        if ip_batch_id is not null then 
+            use_batch := 1;
+        else
+            use_batch := 0;
+        end if;
+    end;
+    
+    /*******************************************************************
+    * Set stopping params
+    ********************************************************************/
+    procedure p_nnt_set_stopping_conditions( ip_max_epochs in number, ip_accuracy in number, ip_mse in number )
+    is 
+    begin
+        if ip_max_epochs is not null then
+            max_epochs := ip_max_epochs;
+        end if;
+        if ip_accuracy is not null then
+            desired_accuracy := ip_accuracy;
+        end if;
+        if ip_mse is not null then
+            desired_mse := ip_mse;
+        end if;
+    end;
+    
+    /*******************************************************************
+    * Return the NN accuracy on the set
+    ********************************************************************/
+    function f_nnt_get_set_accuracy( ip_data_recs in data_recs ) return number
+    is
+        incorrect_results number := 0;
+        arr_res num_arr := num_arr();
+    begin
+
+        for z in ip_data_recs.first..ip_data_recs.last
+        loop                
+            --feed inputs through network and backpropagate errors
+            arr_res := f_nn_feed_forward_pattern( ip_data_recs(z).input_data );
+
+            --check all outputs against desired output values
+            for z1 in 1..cnt_output_neurons
+            loop
+                --set flag to false if desired and output differ
+                if ( arr_res(z1) != ip_data_recs(z).res_data(z1) ) then 
+                    incorrect_results := incorrect_results + 1;
+                    exit;
+                end if;
+                
+            end loop; 
+        end loop;
+        
+        return incorrect_results;
+    end;
+    /*******************************************************************
+    * Return the NN mean squared error on the set
+    ********************************************************************/
+    function f_nnt_get_set_mse( ip_data_recs in data_recs ) return number-- mse - mean squared error
+    is
+        mse number := 0;-- mean squared error
+    begin    
+
+        for z in ip_data_recs.first..ip_data_recs.last
+        loop
+            --feed inputs through network and backpropagate errors
+            p_nn_feed_forward( ip_data_recs(z).input_data );
+            
+            --check all outputs against desired output values
+            for z1 in 1..cnt_output_neurons
+            loop
+                --sum all the MSEs together
+                mse := mse + power((output_neurons_arr(z1) - ip_data_recs(z).res_data(z1)), 2);
+            end loop;
+        end loop;
+        
+        --calculate error and return as percentage
+        return mse/(cnt_output_neurons * ip_data_recs.count);
+        
+    end;
+    
+    /*******************************************************************
+    *
+    ********************************************************************/
+    function f_nnt_get_output_err_gradient( ip_desired_value in number, ip_output_value in number ) return number
+    is 
+    begin
+        return ip_output_value * ( 1 - ip_output_value ) * ( ip_desired_value - ip_output_value );
+    end;
+    
+    /*******************************************************************
+    *
+    ********************************************************************/
+    function f_nnt_get_hidden_err_gradient( ip_z in number ) return number
+    is
+        weighted_sum number := 0;
+    begin
+        
+        for z in 1..cnt_output_neurons
+        loop
+            weighted_sum := weighted_sum + weights_hidden_output_arr(ip_z)(z) * output_error_gradients_arr(z);
+        end loop;
+        
+        return hidden_neurons_arr(ip_z) * ( 1 - hidden_neurons_arr(ip_z) ) * weighted_sum;
+    end;
+    
+    /*******************************************************************
+    *
+    ********************************************************************/
+    procedure p_nnt_update_weights
+    is 
+    begin
+        --input -> hidden weights
+        for z in 1..cnt_input_neurons
+        loop
+            for z1 in 1..cnt_hidden_neurons 
+            loop
+                --update weight
+                weights_input_hidden_arr(z)(z1) := weights_input_hidden_arr(z)(z1) + delta_input_hidden_arr(z)(z1);    
+                
+                --clear delta only if using batch (previous delta is needed for momentum
+                if ( use_batch = 1 ) then 
+                    delta_input_hidden_arr(z)(z1) := 0;
+                end if;                
+            end loop;
+        end loop;
+        
+        --hidden -> output weights
+        for z in 1..cnt_hidden_neurons
+        loop
+            for z1 in 1..cnt_output_neurons 
+            loop
+                --update weight
+                weights_hidden_output_arr(z)(z1) := weights_hidden_output_arr(z)(z1) 
+                                                    + delta_hidden_output_arr(z)(z1);
+                
+                --clear delta only if using batch (previous delta is needed for momentum)
+                if ( use_batch = 1 ) then 
+                    delta_hidden_output_arr(z)(z1) := 0;
+                end if;
+            end loop;
+        end loop;
+    end;
+    
+    /*******************************************************************
+    *
+    ********************************************************************/
+    procedure p_nnt_backpropagate(ip_data_rec in num_arr)
+    is
+    begin
+        --modify deltas between hidden and output layers
+        for z in 1..cnt_output_neurons
+        loop
+            --get error gradient for every output node
+            output_error_gradients_arr(z) := f_nnt_get_output_err_gradient( ip_data_rec(z), output_neurons_arr(z) );
+            
+            --for all nodes in hidden layer and bias neuron
+            for z1 in 1..cnt_hidden_neurons 
+            loop                
+                --calculate change in weight
+                if ( use_batch = 0 ) then 
+                    delta_hidden_output_arr(z1)(z) := learning_rate 
+                                                      * hidden_neurons_arr(z1) 
+                                                      * output_error_gradients_arr(z) 
+                                                      + momentum 
+                                                      * delta_hidden_output_arr(z1)(z);
+                else 
+                    delta_hidden_output_arr(z1)(z) := delta_hidden_output_arr(z1)(z) 
+                                                      + learning_rate 
+                                                      * hidden_neurons_arr(z1) 
+                                                      * output_error_gradients_arr(z);
+                end if;
+            end loop;
+        end loop;
+
+        --modify deltas between input and hidden layers
+        for z in 1..cnt_hidden_neurons
+        loop
+            --get error gradient for every hidden node
+            hidden_error_gradients_arr(z) := f_nnt_get_hidden_err_gradient( z );
+
+            --for all nodes in input layer and bias neuron
+            for z1 in 1..cnt_input_neurons
+            loop
+                --calculate change in weight 
+                if ( use_batch = 0) then
+                    delta_input_hidden_arr(z1)(z) := learning_rate 
+                                                     * input_neurons_arr(z1) 
+                                                     * hidden_error_gradients_arr(z)
+                                                     + momentum * delta_input_hidden_arr(z1)(z);
+                else 
+                    delta_input_hidden_arr(z1)(z) := delta_input_hidden_arr(z1)(z) 
+                                                     + learning_rate * input_neurons_arr(z1) 
+                                                     * hidden_error_gradients_arr(z); 
+                end if;
+            end loop;
+        end loop;
+        
+        --if using stochastic learning update the weights immediately
+        if ( use_batch = 0 ) then 
+            p_nnt_update_weights();
+        end if;
+    
+    end;
+    
+    /*******************************************************************
+    *
+    ********************************************************************/
+    procedure p_nnt_run_training_epoch( ip_data_recs in data_recs )
+    is
+        incorrect_patterns number := 0;
+        mse number := 0;
+        pattern_correct number := 0;
+        
+        x_res num_arr;
+        
+    begin
+
+        for z in 1..ip_data_recs.count
+        loop                        
+            --feed inputs through network and backpropagate errors
+            x_res := f_nn_feed_forward_pattern( ip_data_recs(z).input_data );
+            p_nnt_backpropagate( ip_data_recs(z).res_data );    
+
+            pattern_correct := 1;
+
+            --check all outputs from neural network against desired values
+            for z1 in 1..cnt_output_neurons
+            loop
+                --pattern incorrect if desired and output differ
+                if ( x_res(z1) != ip_data_recs(z).res_data(z1) ) then 
+                    pattern_correct := 0;
+                end if;
+                
+                --calculate MSE
+                mse := mse + power(( output_neurons_arr(z1) - ip_data_recs(z).res_data(z1) ), 2);
+            end loop;
+            
+            --if pattern is incorrect add to incorrect count
+            if ( pattern_correct = 0 ) then 
+                incorrect_patterns := incorrect_patterns + 1;    
+            end if;
+            
+        end loop;
+
+        --if using batch learning - update the weights
+        if ( use_batch = 1 ) then 
+            p_nnt_update_weights();
+        end if;
+        
+        --update training accuracy and MSE
+        training_set_accuracy := 100 - ((incorrect_patterns/ip_data_recs.count) * 100);
+        training_set_mse := mse / ( cnt_output_neurons * ip_data_recs.count );
+        
+    end;
+    
+    /*******************************************************************
+    * run training
+    ********************************************************************/
+    procedure p_nnt_train_network
+    is
+        previous_t_accuracy number := 0;
+        previous_g_accuracy number := 0;
+        start_time number;
+    begin
+        
+        dbms_output.put_line('Neural Network Training Starting:');
+        dbms_output.put_line('==========================================================================');
+        dbms_output.put_line('LR: '||learning_rate||' / Momentum: '||momentum||' / Max Epochs: '||max_epochs);
+        dbms_output.put_line('Input Neurons : '||cnt_input_neurons
+                             ||' / Hidden Neurons : '||cnt_hidden_neurons
+                             ||' / Output Neurons : '||cnt_output_neurons);
+        dbms_output.put_line('==========================================================================');
+
+        epoch := 0;
+            
+        --train network using training dataset for training and generalization dataset for testing
+        while (    
+                ( training_set_accuracy < desired_accuracy OR generalization_set_accuracy < desired_accuracy ) 
+                AND epoch < max_epochs 
+              )                
+        loop        
+            start_time := dbms_utility.get_time;    
+            --store previous accuracy
+            previous_t_accuracy := training_set_accuracy;
+            previous_g_accuracy := generalization_set_accuracy;
+
+            --use training set to train network
+            p_nnt_run_training_epoch( x_data_set.training_set );
+
+            --get generalization set accuracy and MSE
+            generalization_set_accuracy := f_nnt_get_set_accuracy( x_data_set.generalization_set );
+            generalization_set_mse := f_nnt_get_set_mse( x_data_set.generalization_set );
+            
+            --print out change in training /generalization accuracy (only if a change is greater than a percent)
+           if ( 
+                   ceil(previous_t_accuracy) != ceil(training_set_accuracy) 
+                OR ceil(previous_g_accuracy) != ceil(generalization_set_accuracy) 
+               )
+            then
+                dbms_output.put_line('Epoch : '||epoch);
+                dbms_output.put_line('TSet Acc: '||training_set_accuracy||'% / MSE: '||training_set_mse);
+                generalization_set_accuracy := 100 
+                                               - ((generalization_set_accuracy/x_data_set.generalization_set.count) 
+                                                  * 100);
+                dbms_output.put_line('GSet Acc: '||generalization_set_accuracy||'% / MSE: '||generalization_set_mse);            
+            end if;
+        
+            epoch := epoch + 1;
+        end loop;
+
+        --get validation set accuracy and MSE
+        validation_set_accuracy := f_nnt_get_set_accuracy( x_data_set.validation_set );
+        validation_set_accuracy := 100 - ((validation_set_accuracy/x_data_set.validation_set.count) * 100);
+        validation_set_mse := f_nnt_get_set_mse( x_data_set.validation_set );
+    
+        --out validation accuracy and MSE
+        dbms_output.put_line('Training Complete!!! - > Elapsed Epochs: '||epoch);
+        dbms_output.put_line('Validation Set Accuracy: '||validation_set_accuracy||'%');
+        dbms_output.put_line('Validation Set MSE: '||validation_set_mse);
+        
+    end;
+    
+    -----------------------------------------------------------------------------------------------
+    -----------------------------------------------------------------------------------------------
+    -----------------------------------------------------------------------------------------------
+    -----------------------------------------------------------------------------------------------
+    -----------------------------------------------------------------------------------------------
+    --INTERFACE FUNCS/PROCS
+    -----------------------------------------------------------------------------------------------
+    -----------------------------------------------------------------------------------------------
+    --NNT INTERFACE FUNCS/PROCS
+    -----------------------------------------------------------------------------------------------
+    /*******************************************************************
+    * run training network process
+    ********************************************************************/
+    procedure p_nnt_run(  ip_nn_id in number,--id of existing neural network - null if not
+                          ip_num_input in number,--number of input perceptrons
+                          ip_num_hidden in number,--number of hidden perceptrons
+                          ip_num_output in number,--number of output perceptrons
+                          ip_lr in number,--learning rate
+                          ip_moment in number,--momentum
+                          ip_max_epochs in number, 
+                          ip_accuracy in number, 
+                          ip_mse in number,
+                          ip_set_id in number default null,--set data for training
+                          ip_batch_id in number default null--batch of data
+                        )
+    is
+        start_time number;
+        tot_start_time number;
+    begin
+        
+        tot_start_time := dbms_utility.get_time;
+        --initialization
+        if ip_nn_id is not null then
+            p_nn_load_data( ip_nn_id );
+        else
+            cnt_input_neurons := ip_num_input;
+            cnt_hidden_neurons := ip_num_hidden;
+            cnt_output_neurons := ip_num_output;
+            ---------------------------------------------------------
+            p_nn_init_arrs( cnt_input_neurons, cnt_hidden_neurons, cnt_output_neurons );
+            p_nn_init_weights_arrs;
+        end if;
+ 
+        ---------------------------------------------------------
+        p_nnt_set_parameters( ip_lr, ip_moment, ip_batch_id);
+        ---------------------------------------------------------
+        p_nnt_set_stopping_conditions( ip_max_epochs, ip_accuracy, ip_mse );
+        ---------------------------------------------------------
+        p_nnt_init_arrs;
+        ---------------------------------------------------------
+        --load data set
+        start_time := dbms_utility.get_time;
+        p_nnt_load_data_set(ip_set_id, ip_batch_id);
+        dbms_output.put_line('LOAD DATA exec time : '||(dbms_utility.get_time - start_time)/100);
+        ---------------------------------------------------------
+        --p_nn_print_data_set('ALL');
+        --p_nn_print_weight_data('ALL');
+        ---------------------------------------------------------
+        --train
+        start_time := dbms_utility.get_time;
+        p_nnt_train_network;
+        dbms_output.put_line('NN TRAIN exec time : '||(dbms_utility.get_time - start_time)/100);
+        ---------------------------------------------------------
+        dbms_output.put_line('TOTAL exec time : '||(dbms_utility.get_time - tot_start_time)/100);
+        
+    end;
+    -----------------------------------------------------------------------------------------------
+    --NN INTERFACE FUNCS/PROCS
+    -----------------------------------------------------------------------------------------------
+    /*******************************************************************
+    *get result for input pattern on a trained network
+    ********************************************************************/
+    procedure p_nn_run( ip_nn_id in number,--id of existing neural network
+                        ip_inputs in num_arr
+                      )
+    is 
+    begin
+    
+        p_nn_load_data( ip_nn_id );
+        
+        if ip_inputs.count = cnt_input_neurons then 
+            output_neurons_arr := f_nn_feed_forward_pattern( ip_inputs );
+            p_nn_print_neuron_data( 'OUTPUT' );
+        else
+            dbms_output.put_line('ERROR! Incorrect number of input values!');
+        end if;
+        
+    end;
+                      
+end pkg_nnet__test_im;

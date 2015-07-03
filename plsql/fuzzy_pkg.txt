@@ -1,0 +1,931 @@
+create or replace package pkg_fuzzy__im_test is
+
+    type input_rec is record(
+                        x_value number,
+                        to_var varchar2(256)
+                       );
+    type input_recs is table of input_rec;
+
+    function f_calc_model_score( ip_model_id in number,ip_input in input_recs ) return number;
+
+end pkg_fuzzy__im_test;
+
+create or replace package body pkg_fuzzy__im_test is
+
+    point_x_precision constant number := 0.1;
+    point_y_precision constant number := 0.01;
+    point_max_iterration_cnt constant number := 10000;
+    defuzzify_points_cnt constant number := 1000;
+    
+    type num_arr is table of number;
+    type point is record (x number,y number);
+    type points is table of point;
+
+    type fuzzy_term is record (
+                                term_name varchar2(256),
+                                term_type varchar2(32),--'TRAPEZOID', 'TRIANGLE'
+                                term_ord number,
+                                term_res_type varchar2(32), --'MIN','MAX'
+                                term_output number,
+                                weight number,
+                                points_arr points,
+                                term_input num_arr,
+                                output_to_var varchar2(256),--used if the term is input
+                                output_to_term varchar2(256)--used if the term is input
+                               );
+
+    type fuzzy_terms is table of fuzzy_term index by varchar2(256);
+
+    type fuzzy_variable is record (
+                                    var_name varchar2(256),
+                                    var_res_type varchar2(32), --'MIN','MAX'
+                                    weight number,
+                                    start_x number,
+                                    end_x number,
+                                    var_output number,
+                                    var_input number,
+                                    output_to_var varchar2(256) default null,
+                                    output_to_term varchar2(256) default null,
+                                    terms_arr fuzzy_terms
+                                  );
+
+    type fuzzy_variables is table of fuzzy_variable index by varchar2(256);
+
+    type fuzzy_model is record (
+                                input_vars fuzzy_variables,
+                                output_vars fuzzy_variables
+                               );
+
+    x_model fuzzy_model;
+
+    -----------------------------------------------------------------------------------------------
+    -----------------------------------------------------------------------------------------------
+    -----------------------------------------------------------------------------------------------
+    -----------------------------------------------------------------------------------------------
+    -----------------------------------------------------------------------------------------------
+    --INITIALIZE, PRINT FUNCS/PROCS
+    -----------------------------------------------------------------------------------------------
+    /*******************************************************************
+    * create new term
+    ********************************************************************/
+    function f_create_term(
+                            ip_term_name in varchar2,
+                            ip_term_res_type in varchar2,
+                            ip_weight in number,
+                            ip_term_ord in number,
+                            ip_term_type in varchar2,
+                            ip_output_to_var in varchar2,
+                            ip_output_to_term in varchar2
+                          )
+    return fuzzy_term
+    is
+        new_term fuzzy_term;
+    begin
+        new_term.term_name := ip_term_name;
+        new_term.term_res_type := ip_term_res_type;
+        new_term.weight := ip_weight;
+        new_term.term_ord := ip_term_ord;
+        new_term.term_type := ip_term_type;
+        new_term.output_to_var := ip_output_to_var;
+        new_term.output_to_term := ip_output_to_term;
+        new_term.points_arr := points();
+        new_term.term_input := num_arr();
+        return new_term;
+    end;
+    /*******************************************************************
+    * add term point
+    ********************************************************************/
+    procedure p_add_term_point( ip_term in out fuzzy_term, ip_x in number, ip_y in number )
+    is
+    begin
+        ip_term.points_arr.extend(1);
+        ip_term.points_arr(ip_term.points_arr.last).x := ip_x;
+        ip_term.points_arr(ip_term.points_arr.last).y := ip_y;
+    end;
+    /*******************************************************************
+    * create new variable
+    ********************************************************************/
+    function f_create_var(
+                            ip_var_name in varchar2,
+                            ip_var_res_type in varchar2,
+                            ip_weight in number,
+                            ip_start_x in number,
+                            ip_end_x in number
+                          )
+    return fuzzy_variable
+    is
+        new_var fuzzy_variable;
+    begin
+        new_var.var_name := ip_var_name;
+        new_var.var_res_type := ip_var_res_type;
+        new_var.weight := ip_weight;
+        new_var.start_x := ip_start_x;
+        new_var.end_x := ip_end_x;
+        new_var.var_output := 0;
+
+        return new_var;
+    end;
+    /*******************************************************************
+    * add term to variable
+    ********************************************************************/
+    procedure p_add_var_term( ip_var in out fuzzy_variable, ip_term in fuzzy_term)
+    is
+    begin
+        ip_var.terms_arr(ip_term.term_name) := ip_term;
+    end;
+    /*******************************************************************
+    * add variable to model
+    ********************************************************************/
+    procedure p_add_var( ip_var_arr in out fuzzy_variables, ip_var in fuzzy_variable)
+    is
+    begin
+        ip_var_arr(ip_var.var_name) := ip_var;
+    end;
+    /*******************************************************************
+    * initialize fuzzy model
+    ********************************************************************/
+    procedure p_init_model_input( ip_input in input_recs )
+    is
+    begin
+        --init input values arr
+        for z in ip_input.first..ip_input.last
+        loop
+            if x_model.input_vars(ip_input(z).to_var).start_x > ip_input(z).x_value
+               or
+               x_model.input_vars(ip_input(z).to_var).end_x < ip_input(z).x_value
+            then
+                if x_model.input_vars(ip_input(z).to_var).start_x > ip_input(z).x_value then
+                    x_model.input_vars(ip_input(z).to_var).var_input := x_model.input_vars(ip_input(z).to_var).start_x;
+                else
+                    x_model.input_vars(ip_input(z).to_var).var_input := x_model.input_vars(ip_input(z).to_var).end_x;
+                end if;
+            else
+                x_model.input_vars(ip_input(z).to_var).var_input := ip_input(z).x_value;
+            end if;
+        end loop;
+    end;
+    /*******************************************************************
+    * initialize fuzzy model
+    ********************************************************************/
+    --test model 1
+    procedure p_init_model_1
+    is
+        x_var fuzzy_variable;
+        x_term fuzzy_term;
+    begin
+        --input var 1
+        x_var := f_create_var( 'AGE', 'MAX', 1, 0, 90 );
+        --term 1
+        x_term := f_create_term( 'YOUNG', 'MAX', 1, 1, 'TRAPEZOID', 'RISK', 'HIGH' );
+        p_add_term_point( x_term, 0, 0 );
+        p_add_term_point( x_term, 0, 1 );
+        p_add_term_point( x_term, 18, 1 );
+        p_add_term_point( x_term, 30, 0 );
+        p_add_var_term( x_var, x_term);
+        --term 2
+        x_term := f_create_term( 'MIDDLE', 'MAX', 1, 2, 'TRIANGLE', 'RISK', 'MEDIUM' );
+        p_add_term_point( x_term, 25, 0 );
+        p_add_term_point( x_term, 40, 1 );
+        p_add_term_point( x_term, 50, 0 );
+        p_add_var_term( x_var, x_term);
+        --term 3
+        x_term := f_create_term( 'OLDER', 'MAX', 1, 3, 'TRAPEZOID', 'RISK', 'LOW' );
+        p_add_term_point( x_term, 45, 0 );
+        p_add_term_point( x_term, 55, 1 );
+        p_add_term_point( x_term, 90, 1 );
+        p_add_term_point( x_term, 90, 0 );
+        p_add_var_term( x_var, x_term);
+
+        p_add_var(x_model.input_vars, x_var);
+
+        --input var 2
+        x_var := f_create_var( 'HPW', 'MAX', 1, 0, 200 );
+        --term 1
+        x_term := f_create_term( 'LOW', 'MAX', 1, 1, 'TRAPEZOID', 'RISK', 'LOW' );
+        p_add_term_point( x_term, 0, 0 );
+        p_add_term_point( x_term, 0, 1 );
+        p_add_term_point( x_term, 50, 1 );
+        p_add_term_point( x_term, 70, 0 );
+        p_add_var_term( x_var, x_term);
+        --term 2
+        x_term := f_create_term( 'MEDIUM', 'MAX', 1, 2, 'TRIANGLE', 'RISK', 'MEDIUM' );
+        p_add_term_point( x_term, 60, 0 );
+        p_add_term_point( x_term, 90, 1 );
+        p_add_term_point( x_term, 110, 0 );
+        p_add_var_term( x_var, x_term);
+        --term 3
+        x_term := f_create_term( 'HIGH', 'MAX', 1, 3, 'TRAPEZOID', 'RISK', 'HIGH' );
+        p_add_term_point( x_term, 100, 0 );
+        p_add_term_point( x_term, 130, 1 );
+        p_add_term_point( x_term, 200, 1 );
+        p_add_term_point( x_term, 200, 0 );
+        p_add_var_term( x_var, x_term);
+
+        p_add_var(x_model.input_vars, x_var);
+
+        --output var 1
+        x_var := f_create_var( 'RISK', 'MAX', 1, 0, 90 );
+        --term 1
+        x_term := f_create_term( 'LOW', 'MAX', 1, 1, 'TRAPEZOID', null, null );
+        p_add_term_point( x_term, 0, 0 );
+        p_add_term_point( x_term, 0, 1 );
+        p_add_term_point( x_term, 20, 1 );
+        p_add_term_point( x_term, 30, 0 );
+        p_add_var_term( x_var, x_term);
+        --term 2
+        x_term := f_create_term( 'MEDIUM', 'MAX', 1, 2, 'TRIANGLE', null, null );
+        p_add_term_point( x_term, 30, 0 );
+        p_add_term_point( x_term, 45, 1 );
+        p_add_term_point( x_term, 60, 0 );
+        p_add_var_term( x_var, x_term);
+        --term 3
+        x_term := f_create_term( 'HIGH', 'MAX', 1, 3, 'TRAPEZOID', null, null );
+        p_add_term_point( x_term, 60, 0 );
+        p_add_term_point( x_term, 75, 1 );
+        p_add_term_point( x_term, 90, 1 );
+        p_add_term_point( x_term, 90, 0 );
+        p_add_var_term( x_var, x_term);
+
+        p_add_var(x_model.output_vars, x_var);
+
+    end;
+    --test model 2
+    procedure p_init_model_2
+    is
+        x_var fuzzy_variable;
+        x_term fuzzy_term;
+    begin
+        --input var 1
+        x_var := f_create_var( 'CLIENT_CALLS', 'MAX', 1, 0, 100 );
+        --term 1
+        x_term := f_create_term( 'LOW', 'MAX', 1, 1, 'TRAPEZOID', 'USER_SCORE', 'LOW' );
+        p_add_term_point( x_term, 0, 0 );
+        p_add_term_point( x_term, 0, 1 );
+        p_add_term_point( x_term, 15, 1 );
+        p_add_term_point( x_term, 30, 0 );
+        p_add_var_term( x_var, x_term);
+        --term 2
+        x_term := f_create_term( 'NORMAL', 'MAX', 1, 2, 'TRIANGLE', 'USER_SCORE', 'NORMAL' );
+        p_add_term_point( x_term, 25, 0 );
+        p_add_term_point( x_term, 40, 1 );
+        p_add_term_point( x_term, 50, 0 );
+        p_add_var_term( x_var, x_term);
+        --term 3
+        x_term := f_create_term( 'HIGH', 'MAX', 1, 3, 'TRIANGLE', 'USER_SCORE', 'HIGH' );
+        p_add_term_point( x_term, 50, 0 );
+        p_add_term_point( x_term, 65, 1 );
+        p_add_term_point( x_term, 80, 0 );
+        p_add_var_term( x_var, x_term);
+        --term 4
+        x_term := f_create_term( 'EXTREAM', 'MAX', 1, 4, 'TRAPEZOID', 'USER_SCORE', 'EXTREAM' );
+        p_add_term_point( x_term, 75, 0 );
+        p_add_term_point( x_term, 90, 1 );
+        p_add_term_point( x_term, 100, 1 );
+        p_add_term_point( x_term, 100, 0 );
+        p_add_var_term( x_var, x_term);
+
+        p_add_var(x_model.input_vars, x_var);
+
+        --input var 2
+        x_var := f_create_var( 'CONTACT_CALLS', 'MAX', 1, 0, 100 );
+        --term 1
+        x_term := f_create_term( 'LOW', 'MAX', 1, 1, 'TRAPEZOID', 'USER_SCORE', 'LOW' );
+        p_add_term_point( x_term, 0, 0 );
+        p_add_term_point( x_term, 0, 1 );
+        p_add_term_point( x_term, 15, 1 );
+        p_add_term_point( x_term, 30, 0 );
+        p_add_var_term( x_var, x_term);
+        --term 2
+        x_term := f_create_term( 'NORMAL', 'MAX', 1, 2, 'TRIANGLE', 'USER_SCORE', 'NORMAL' );
+        p_add_term_point( x_term, 25, 0 );
+        p_add_term_point( x_term, 40, 1 );
+        p_add_term_point( x_term, 50, 0 );
+        p_add_var_term( x_var, x_term);
+        --term 3
+        x_term := f_create_term( 'HIGH', 'MAX', 1, 3, 'TRIANGLE', 'USER_SCORE', 'HIGH' );
+        p_add_term_point( x_term, 50, 0 );
+        p_add_term_point( x_term, 65, 1 );
+        p_add_term_point( x_term, 80, 0 );
+        p_add_var_term( x_var, x_term);
+        --term 4
+        x_term := f_create_term( 'EXTREAM', 'MAX', 1, 4, 'TRAPEZOID', 'USER_SCORE', 'EXTREAM' );
+        p_add_term_point( x_term, 75, 0 );
+        p_add_term_point( x_term, 90, 1 );
+        p_add_term_point( x_term, 100, 1 );
+        p_add_term_point( x_term, 100, 0 );
+        p_add_var_term( x_var, x_term);
+
+        p_add_var(x_model.input_vars, x_var);
+
+        --input var 3
+        x_var := f_create_var( 'CR_CALLS', 'MAX', 1, 0, 100 );
+        --term 1
+        x_term := f_create_term( 'LOW', 'MAX', 1, 1, 'TRAPEZOID', 'USER_SCORE', 'LOW' );
+        p_add_term_point( x_term, 0, 0 );
+        p_add_term_point( x_term, 0, 1 );
+        p_add_term_point( x_term, 15, 1 );
+        p_add_term_point( x_term, 30, 0 );
+        p_add_var_term( x_var, x_term);
+        --term 2
+        x_term := f_create_term( 'NORMAL', 'MAX', 1, 2, 'TRIANGLE', 'USER_SCORE', 'NORMAL' );
+        p_add_term_point( x_term, 25, 0 );
+        p_add_term_point( x_term, 40, 1 );
+        p_add_term_point( x_term, 50, 0 );
+        p_add_var_term( x_var, x_term);
+        --term 3
+        x_term := f_create_term( 'HIGH', 'MAX', 1, 3, 'TRIANGLE', 'USER_SCORE', 'HIGH' );
+        p_add_term_point( x_term, 50, 0 );
+        p_add_term_point( x_term, 65, 1 );
+        p_add_term_point( x_term, 80, 0 );
+        p_add_var_term( x_var, x_term);
+        --term 4
+        x_term := f_create_term( 'EXTREAM', 'MAX', 1, 4, 'TRAPEZOID', 'USER_SCORE', 'EXTREAM' );
+        p_add_term_point( x_term, 75, 0 );
+        p_add_term_point( x_term, 90, 1 );
+        p_add_term_point( x_term, 100, 1 );
+        p_add_term_point( x_term, 100, 0 );
+        p_add_var_term( x_var, x_term);
+
+        p_add_var(x_model.input_vars, x_var);
+
+        --output var 1
+        x_var := f_create_var( 'USER_SCORE', 'MAX', 1, 0, 100 );
+        --term 1
+        x_term := f_create_term( 'LOW', 'MAX', 1, 1, 'TRIANGLE', null, null );
+        p_add_term_point( x_term, 0, 0 );
+        p_add_term_point( x_term, 12.5, 1 );
+        p_add_term_point( x_term, 25, 0 );
+        p_add_var_term( x_var, x_term);
+        --term 2
+        x_term := f_create_term( 'NORMAL', 'MAX', 1, 2, 'TRIANGLE', null, null );
+        p_add_term_point( x_term, 25, 0 );
+        p_add_term_point( x_term, 37.5, 1 );
+        p_add_term_point( x_term, 50, 0 );
+        p_add_var_term( x_var, x_term);
+        --term 3
+        x_term := f_create_term( 'HIGH', 'MAX', 1, 3, 'TRIANGLE', null, null );
+        p_add_term_point( x_term, 50, 0 );
+        p_add_term_point( x_term, 62.5, 1 );
+        p_add_term_point( x_term, 75, 0 );
+        p_add_var_term( x_var, x_term);
+        --term 4
+        x_term := f_create_term( 'EXTREAM', 'MAX', 1, 4, 'TRIANGLE', null, null );
+        p_add_term_point( x_term, 75, 0 );
+        p_add_term_point( x_term, 87.5, 1 );
+        p_add_term_point( x_term, 100, 0 );
+        p_add_var_term( x_var, x_term);
+
+        p_add_var(x_model.output_vars, x_var);
+
+    end;
+
+    procedure p_init_model( ip_model_id in number)
+    is
+    begin
+        if ip_model_id is not null then
+            null;
+        else
+            p_init_model_2;
+        end if;
+    end;
+    -----------------------------------------------------------------------------------------------
+    -----------------------------------------------------------------------------------------------
+    -----------------------------------------------------------------------------------------------
+    -----------------------------------------------------------------------------------------------
+    -----------------------------------------------------------------------------------------------
+    --PRINT FUNCS/PROCS
+    -----------------------------------------------------------------------------------------------
+    /*******************************************************************
+    * print input arr
+    ********************************************************************/
+    procedure p_print_input
+    is
+        x_el varchar2(512):= null;
+    begin
+        x_el := x_model.input_vars.first;
+        while (x_el is not null)
+        loop
+            dbms_output.put_line( ' VAR : '||x_model.input_vars(x_el).var_name||' / '
+                                  ||'VAL : '||x_model.input_vars(x_el).var_input
+                                 );
+            x_el := x_model.input_vars.next(x_el);
+        end loop;
+    end;
+    /*******************************************************************
+    * print input vars
+    ********************************************************************/
+    procedure p_print_input_vars
+    is
+        x_el varchar2(512):= null;
+    begin
+        x_el := x_model.input_vars.first;
+        while (x_el is not null)
+        loop
+            dbms_output.put_line(' VAR : '||x_model.input_vars(x_el).var_name||' / '
+                                 ||'DEGREE : '||x_model.input_vars(x_el).var_output||' / '
+                                 ||'OUTPUT TO '||x_model.input_vars(x_el).output_to_var
+                                 ||'.'||x_model.input_vars(x_el).output_to_term
+                                );
+            x_el := x_model.input_vars.next(x_el);
+        end loop;
+    end;
+    /*******************************************************************
+    * print output vars terms
+    ********************************************************************/
+    procedure p_print_output_vars_terms
+    is
+        x_el varchar2(256) := null;
+        x_el2 varchar2(256) := null;
+    begin
+        x_el := x_model.output_vars.first;
+        while (x_el is not null)
+        loop
+            dbms_output.put_line(' VAR : '||x_model.output_vars(x_el).var_name);
+            x_el2 := x_model.output_vars(x_el).terms_arr.first;
+            while (x_el2 is not null)
+            loop
+                dbms_output.put_line('  TERM : '||x_model.output_vars(x_el).terms_arr(x_el2).term_name||' / '
+                                     ||'DEGREE : '||x_model.output_vars(x_el).terms_arr(x_el2).term_output
+                                );
+
+                x_el2 := x_model.output_vars(x_el).terms_arr.next(x_el2);
+            end loop;
+
+            x_el := x_model.output_vars.next(x_el);
+        end loop;
+    end;
+    /*******************************************************************
+    * print output vars
+    ********************************************************************/
+    procedure p_print_output_vars
+    is
+        x_el varchar2(256) := null;
+        x_el2 varchar2(256) := null;
+    begin
+        x_el := x_model.output_vars.first;
+        while (x_el is not null)
+        loop
+            dbms_output.put_line(' VAR : '||x_model.output_vars(x_el).var_name||' / '
+                                 ||'SCORE : '||x_model.output_vars(x_el).var_output);
+            x_el2 := x_model.output_vars(x_el).terms_arr.first;
+
+            x_el := x_model.output_vars.next(x_el);
+        end loop;
+    end;
+    -----------------------------------------------------------------------------------------------
+    -----------------------------------------------------------------------------------------------
+    -----------------------------------------------------------------------------------------------
+    -----------------------------------------------------------------------------------------------
+    -----------------------------------------------------------------------------------------------
+    --POINTS FUNCS/PROCS
+    -----------------------------------------------------------------------------------------------
+    /*******************************************************************
+    * get point x value
+    ********************************************************************/
+    function f_calc_point_x( ip_y in number, ip_p1 in point, ip_p2 in point ) return number
+    is
+        out_x number := ip_p1.x;
+        cnt number :=0;
+        change_direction varchar2(32) := null;
+        res_down number := ip_p1.x;
+        res_up number := ip_p2.x;
+        value_down number := ip_p1.x;
+        value_up number := ip_p2.x;
+    begin
+
+        while true
+        loop
+            if change_direction is null or change_direction = 'UP' then
+                out_x := value_down;
+                res_down := ( out_x - ip_p1.x )*( ip_p2.y - ip_p1.y) - ( ip_y - ip_p1.y)*( ip_p2.x - ip_p1.x);
+
+                if res_down < point_x_precision and res_down > -point_x_precision then
+                    exit;
+                end if;
+            end if;
+            if change_direction is null or change_direction = 'DOWN' then
+                out_x := value_up;
+                res_up := ( out_x - ip_p1.x )*( ip_p2.y - ip_p1.y) - ( ip_y - ip_p1.y)*( ip_p2.x - ip_p1.x);
+
+                if res_down < point_x_precision and res_down > -point_x_precision then
+                    exit;
+                end if;
+            end if;
+
+            if res_up*res_up > res_down*res_down then
+              value_up := value_up - (value_up-value_down)/2;
+              change_direction := 'DOWN';
+            else
+              value_down := value_down+(value_up-value_down)/2;
+              change_direction := 'UP';
+            end if;
+
+            cnt := cnt + 1;
+            if cnt = point_max_iterration_cnt then
+                out_x := null;
+                exit;
+            end if;
+        end loop;
+
+        return out_x;
+    end;
+    /*******************************************************************
+    * get point y value
+    ********************************************************************/
+    function f_calc_point_y( ip_x in number, ip_p1 in point, ip_p2 in point ) return number
+    is
+        out_y number := 0;
+        cnt number := 0;
+        change_direction varchar2(32) := null;
+        res_down number := 0;
+        res_up number := 1;
+        value_down number := 0;
+        value_up number := 1;
+    begin
+        while true
+        loop
+            if change_direction is null or change_direction = 'UP' then
+                out_y := value_down;
+                res_down := ( ip_x - ip_p1.x )*( ip_p2.y - ip_p1.y) - ( out_y - ip_p1.y)*( ip_p2.x - ip_p1.x);
+
+                if res_down < point_y_precision and res_down > -point_y_precision then
+                    exit;
+                end if;
+            end if;
+            if change_direction is null or change_direction = 'DOWN' then
+                out_y := value_up;
+                res_up := ( ip_x - ip_p1.x )*( ip_p2.y - ip_p1.y) - ( out_y - ip_p1.y)*( ip_p2.x - ip_p1.x);
+
+                if res_up < point_y_precision and res_up > -point_y_precision then
+                    exit;
+                end if;
+            end if;
+
+            if res_up*res_up > res_down*res_down then
+              value_up := value_up - (value_up-value_down)/2;
+              change_direction := 'DOWN';
+            else
+              value_down := value_down+(value_up-value_down)/2;
+              change_direction := 'UP';
+            end if;
+
+            cnt := cnt + 1;
+            if cnt = point_max_iterration_cnt then
+                out_y := null;
+                exit;
+            end if;
+        end loop;
+
+        return out_y;
+    end;
+
+    function f_intersect_point_two_lines( ip_l1_p1 in point, ip_l1_p2 in point, ip_l2_p1 in point, ip_l2_p2 in point )
+    return point
+    is
+        res_point point;
+        line1_slope number := 0;
+        line2_slope number := 0;
+        line1_intercept number := 0;
+        line2_intercept number := 0;
+        d_x number := 0;
+        d_y number := 0;
+    begin
+
+        d_x := ip_l1_p2.x - ip_l1_p1.x;
+        d_y := ip_l1_p2.y - ip_l1_p1.y;
+
+        line1_slope := d_y / d_x;
+        line1_intercept := ip_l1_p1.y - line1_slope * ip_l1_p1.x;
+
+        d_x := ip_l2_p2.x - ip_l2_p1.x;
+        d_y := ip_l2_p2.y - ip_l2_p1.y;
+
+        line2_slope := d_y / d_x;
+        line2_intercept := ip_l2_p1.y - line2_slope * ip_l2_p1.x;
+
+        if line1_slope - line2_slope = 0 then
+            res_point.x := null;
+            res_point.y := null;
+        else
+            res_point.x := (line2_intercept - line1_intercept) / (line1_slope - line2_slope);
+            res_point.y := line2_slope * res_point.x + line1_intercept;
+        end if;
+
+        return res_point;
+    end;
+    /*******************************************************************
+    * calculate line length
+    ********************************************************************/
+    function f_calc_line_length(ip_p1 in point, ip_p2 in point) return number
+    is
+    begin
+        return sqrt((ip_p2.x - ip_p1.x)*(ip_p2.x - ip_p1.x) + (ip_p2.y - ip_p1.y)*(ip_p2.y - ip_p1.y));
+    end;
+    -----------------------------------------------------------------------------------------------
+    -----------------------------------------------------------------------------------------------
+    -----------------------------------------------------------------------------------------------
+    -----------------------------------------------------------------------------------------------
+    -----------------------------------------------------------------------------------------------
+    --FUZZY MODEL FUNCS/PROCS
+    -----------------------------------------------------------------------------------------------
+    /*******************************************************************
+    * calculate term degree for given input
+    ********************************************************************/
+    procedure p_calc_input_term_degree( ip_term in out fuzzy_term )
+    is
+        res_degree number := 0;
+    begin
+        ip_term.term_output := 0;
+        if ip_term.term_input.first is not null then
+            for z in ip_term.term_input.first..ip_term.term_input.last
+            loop
+                if      ip_term.term_input(z) >= ip_term.points_arr(ip_term.points_arr.first).x
+                    and ip_term.term_input(z) <= ip_term.points_arr(ip_term.points_arr.last).x
+                then
+                    for z1 in 1..(ip_term.points_arr.count-1)
+                    loop
+                        res_degree := 0;
+                        if     ip_term.term_input(z) >= ip_term.points_arr(z1).x
+                           and ip_term.term_input(z) <= ip_term.points_arr(z1+1).x
+                        then
+                            res_degree := f_calc_point_y(ip_term.term_input(z),ip_term.points_arr(z1),ip_term.points_arr(z1+1));
+                            exit;
+                        end if;
+                    end loop;
+                end if;
+
+                if res_degree > 0 then
+                    if      ip_term.term_res_type = 'MIN'
+                        and (res_degree < ip_term.term_output or ip_term.term_output = 0)
+                    then
+                        ip_term.term_output := res_degree;
+                    end if;
+
+                    if ip_term.term_res_type = 'MAX' and res_degree > ip_term.term_output then
+                        ip_term.term_output := res_degree;
+                    end if;
+                end if;
+            end loop;
+        end if;
+    end;
+    /*******************************************************************
+    * calculate term degree for based on the already calculated degrees
+    ********************************************************************/
+    procedure p_calc_output_term_degree( ip_term in out fuzzy_term )
+    is
+    begin
+        ip_term.term_output := 0;
+
+        if ip_term.term_input.first is not null then
+            for z in ip_term.term_input.first..ip_term.term_input.last
+            loop
+                if      ip_term.term_res_type = 'MIN'
+                    and (ip_term.term_input(z) < ip_term.term_output or ip_term.term_output = 0)
+                then
+                    ip_term.term_output := ip_term.term_input(z);
+                end if;
+
+                if ip_term.term_res_type = 'MAX' and ip_term.term_input(z) > ip_term.term_output then
+                    ip_term.term_output := ip_term.term_input(z);
+                end if;
+            end loop;
+
+            ip_term.term_output := ip_term.weight * ip_term.term_output;
+        end if;
+    end;
+    /*******************************************************************
+    * calculate variable degree for given input
+    ********************************************************************/
+    procedure p_calc_input_var_degree(ip_variable in out fuzzy_variable)
+    is
+        x_el varchar2(512):= null;
+    begin
+        case ip_variable.var_res_type
+            when 'MIN' then ip_variable.var_output := 1;
+            when 'MAX' then ip_variable.var_output := 0;
+        end case;
+        x_el := ip_variable.terms_arr.first;
+        while (x_el is not null)
+        loop
+            ip_variable.terms_arr(x_el).term_input.extend(1);
+            ip_variable.terms_arr(x_el).term_input(ip_variable.terms_arr(x_el).term_input.last) := ip_variable.var_input;
+
+            p_calc_input_term_degree( ip_variable.terms_arr(x_el) );
+
+            if ip_variable.var_res_type = 'MIN' then
+                if ip_variable.terms_arr(x_el).term_output <= ip_variable.var_output or ip_variable.var_output = 0 then
+                    ip_variable.var_output := ip_variable.terms_arr(x_el).term_output;
+                    ip_variable.output_to_var := ip_variable.terms_arr(x_el).output_to_var;
+                    ip_variable.output_to_term := ip_variable.terms_arr(x_el).output_to_term;
+                end if;
+            end if;
+            if ip_variable.var_res_type = 'MAX' then
+                if ip_variable.terms_arr(x_el).term_output >= ip_variable.var_output then
+                    ip_variable.var_output := ip_variable.terms_arr(x_el).term_output;
+                    ip_variable.output_to_var := ip_variable.terms_arr(x_el).output_to_var;
+                    ip_variable.output_to_term := ip_variable.terms_arr(x_el).output_to_term;
+                end if;
+            end if;
+
+            x_el := ip_variable.terms_arr.next(x_el);
+        end loop;
+
+        ip_variable.var_output := ip_variable.var_output * ip_variable.weight;
+    end;
+    /*******************************************************************
+    * calculate model input variables and pass result to output variables for later use
+    ********************************************************************/
+    procedure p_calc_input_vars_degree
+    is
+        x_var_name varchar2(256);
+        x_term_name varchar2(256);
+        x_res_degree number;
+
+        x_arr_cnt number;
+        x_el varchar2(256);
+    begin
+        --calculate the result from the input variables based on the input data
+        --and pass it to the output variables
+        x_el := x_model.input_vars.first;
+        while (x_el is not null)
+        loop
+            if x_model.input_vars(x_el).var_input is not null then
+                p_calc_input_var_degree( x_model.input_vars(x_el) );
+
+                x_res_degree := x_model.input_vars(x_el).var_output;
+                x_var_name := x_model.input_vars(x_el).output_to_var;
+                x_term_name := x_model.input_vars(x_el).output_to_term;
+
+                x_model.output_vars(x_var_name).terms_arr(x_term_name).term_input.extend(1);
+                x_arr_cnt := x_model.output_vars(x_var_name).terms_arr(x_term_name).term_input.last;
+                x_model.output_vars(x_var_name).terms_arr(x_term_name).term_input(x_arr_cnt) := x_res_degree;
+            end if;
+            x_el := x_model.input_vars.next(x_el);
+        end loop;
+    end;
+
+    /*******************************************************************
+    * calculate model output variables term degrees
+    ********************************************************************/
+    procedure p_calc_output_vars_degree
+    is
+        x_el varchar2(512):= null;
+        x_el2 varchar2(512):= null;
+    begin
+
+        x_el := x_model.output_vars.first;
+        while (x_el is not null)
+        loop
+            x_el2 := x_model.output_vars(x_el).terms_arr.first;
+            while (x_el2 is not null)
+            loop
+                p_calc_output_term_degree( x_model.output_vars(x_el).terms_arr(x_el2) );
+
+                x_el2 := x_model.output_vars(x_el).terms_arr.next(x_el2);
+            end loop;
+
+            x_el := x_model.output_vars.next(x_el);
+        end loop;
+    end;
+    /*******************************************************************
+    * defuzzify output variables to calculate variable score
+    ********************************************************************/
+    procedure p_calc_output_vars_score
+    is
+        x_el varchar2(512):= null;
+        x_el2 varchar2(512):= null;
+
+        x_sum1 number;
+        x_sum2 number;
+        start_x number := 0;
+        end_x number := 0;
+        tmp_x number := 0;
+        tmp_y number := 0;
+        x_step number := 0;
+
+        x_point point;
+        output_var_deffuzify_points points := points();
+        x_term fuzzy_term;
+    begin
+        x_el := x_model.output_vars.first;
+        while (x_el is not null)
+        loop
+
+            output_var_deffuzify_points.delete;
+            --get variable start and end points x coordinate
+            start_x := x_model.output_vars(x_el).start_x;
+            end_x := x_model.output_vars(x_el).end_x;
+
+            tmp_x := start_x;
+            x_step := (end_x - start_x)/defuzzify_points_cnt;
+            --init points arr with x coordinate values
+            for z in 1..defuzzify_points_cnt
+            loop
+                tmp_x := tmp_x + x_step;
+
+                x_point.x := tmp_x;
+                x_point.y := 0;
+                output_var_deffuzify_points.extend(1);
+                output_var_deffuzify_points(z) := x_point;
+
+                if tmp_x > end_x then
+                    output_var_deffuzify_points(output_var_deffuzify_points.last).x := end_x;
+                    exit;
+                end if;
+            end loop;
+
+            --init points arr with y coordinate values
+            x_el2 := x_model.output_vars(x_el).terms_arr.first;
+            while (x_el2 is not null)
+            loop
+                x_term := x_model.output_vars(x_el).terms_arr(x_el2);
+
+                for z in 1..(x_term.points_arr.last-1)
+                loop
+                    for z1 in 1..defuzzify_points_cnt
+                    loop
+                        if output_var_deffuzify_points(z1).x >= x_term.points_arr(z).x
+                           and
+                           output_var_deffuzify_points(z1).x <= x_term.points_arr(z+1).x
+                        then
+                            tmp_y := f_calc_point_y( output_var_deffuzify_points(z1).x,
+                                                     x_term.points_arr(z),
+                                                     x_term.points_arr(z+1));
+
+                            if tmp_y > x_model.output_vars(x_el).terms_arr(x_el2).term_output then
+                                tmp_y := x_model.output_vars(x_el).terms_arr(x_el2).term_output;
+                            end if;
+                            if output_var_deffuzify_points(z1).y < tmp_y then
+                                output_var_deffuzify_points(z1).y := tmp_y;
+                            end if;
+                            if output_var_deffuzify_points(z1).x > x_term.points_arr(z+1).x then
+                                exit;
+                            end if;
+                        end if;
+                    end loop;
+                end loop;
+
+                x_el2 := x_model.output_vars(x_el).terms_arr.next(x_el2);
+            end loop;
+
+            --calculate output score of the ariable
+            x_sum1 := 0;
+            x_sum2 := 0;
+            for z in 1..defuzzify_points_cnt
+            loop
+                x_sum1 := x_sum1 + output_var_deffuzify_points(z).x*output_var_deffuzify_points(z).y;
+                x_sum2 := x_sum2 + output_var_deffuzify_points(z).y;
+            end loop;
+            if x_sum2 > 0 then
+                x_model.output_vars(x_el).var_output := x_sum1/x_sum2;
+            else
+                x_model.output_vars(x_el).var_output := 0;
+            end if;
+            x_el := x_model.output_vars.next(x_el);
+        end loop;
+    end;
+    /*******************************************************************
+    * calculate model score for given input
+    ********************************************************************/
+    function f_calc_model_score( ip_model_id in number, ip_input in input_recs ) return number
+    is
+        start_time number;
+        tot_start_time number;
+    begin
+        tot_start_time := dbms_utility.get_time;
+
+        --initialization of objects
+        p_init_model( ip_model_id );
+        p_init_model_input( ip_input );
+
+        dbms_output.put_line('Input parameters');
+        p_print_input;
+        dbms_output.put_line('');
+
+        start_time := dbms_utility.get_time;
+        dbms_output.put_line('Start Calculate input vars');
+        p_calc_input_vars_degree;
+        p_print_input_vars;
+        dbms_output.put_line('End Calculate input vars exec time : '||(dbms_utility.get_time - start_time)/100);
+        dbms_output.put_line('');
+
+        start_time := dbms_utility.get_time;
+        dbms_output.put_line('Start Calculate output vars degrees');
+        p_calc_output_vars_degree;
+        p_print_output_vars_terms;
+        dbms_output.put_line('End Calculate output vars degrees exec time : '||(dbms_utility.get_time - start_time)/100);
+        dbms_output.put_line('');
+
+        start_time := dbms_utility.get_time;
+        dbms_output.put_line('Start Calculate output vars score');
+        p_calc_output_vars_score;
+        p_print_output_vars;
+        dbms_output.put_line('End Calculate output vars score exec time : '||(dbms_utility.get_time - start_time)/100);
+        dbms_output.put_line('');
+
+        dbms_output.put_line('TOTAL exec time : '||(dbms_utility.get_time - tot_start_time)/100);
+
+        return 0;
+    end;
+
+end pkg_fuzzy__im_test;
